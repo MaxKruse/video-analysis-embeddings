@@ -23,8 +23,9 @@ query: "Ear blowing sounds"   collection video_clips (184 vectors)
 2. Vectors go into a single Chroma collection (`video_clips`, cosine) with metadata
    `{file, name, file_id, clip_index, t_start, t_end, modality, fps, duration}`.
 3. `start --search` embeds the query with the EmbeddingGemma 2 search prefix, queries
-   Chroma, collapses the three vectors of the same clip to one row, and prints the
-   timestamp range.
+   Chroma with a candidate pool wider than k, collapses the three vectors of the same
+   clip to one row, and keeps only the best clip of each video - so the top k are k
+   distinct videos. `--file` drills into one video and returns its matching clips.
 
 Three vectors per clip is deliberate: for sound-event queries ("ear blowing sounds")
 the audio-only vector is not diluted by ~85 % video tokens, while `combined` still
@@ -121,7 +122,7 @@ bun run doctor     # prints resolved config, then pings Chroma and the endpoint
 |Command|Flags|
 |---|---|
 |`bun run db:ingest -- <folder>`|`--fresh` (ignore the change manifest), `--keep-media` (keep extracted frames/WAV)|
-|`bun run start -- --search "<q>"`|`--k N` (default 5), `--file NAME` (basename or relative path), `--modality audio\|video\|combined`, `--json`|
+|`bun run start -- --search "<q>"`|`--k N` (default 5, distinct videos), `--file NAME` (basename or relative path; returns the matching clips of that video), `--modality audio\|video\|combined`, `--json`|
 |`bun run db:clear`|drops the collection, the manifest and the media cache|
 |`bun run doctor`|-|
 

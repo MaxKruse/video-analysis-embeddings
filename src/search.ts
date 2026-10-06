@@ -1,7 +1,7 @@
 import type { Where } from "chromadb";
 import { openCollection } from "./chroma.ts";
 import type { Config } from "./config.ts";
-import { Embedder, MODALITIES, type Modality } from "./embedder.ts";
+import { Embedder, type Modality } from "./embedder.ts";
 import { fmtTime } from "./windows.ts";
 
 export interface SearchOptions {
@@ -30,15 +30,22 @@ export async function search(cfg: Config, query: string, opts: SearchOptions): P
 
   const embedder = new Embedder(cfg);
   const queryVector = await embedder.embedText(cfg.queryPrefix + query);
+  // A global search collapses to one row per video, so fetch a pool wide
+  // enough to still hold k distinct videos after the collapse.
+  const pool = Math.min(total, Math.max(opts.k * 10, 30));
   const result = await collection.query({
     queryEmbeddings: [queryVector],
-    nResults: Math.min(Math.max(opts.k * MODALITIES.length, opts.k + 3), total),
+    nResults: pool,
     where: buildWhere(opts),
   });
 
-  const hits = dedupe(result.ids[0] ?? [], result.metadatas[0] ?? [], result.distances[0] ?? []);
-  hits.sort((a, b) => b.score - a.score);
-  const top = hits.slice(0, opts.k);
+  const top = rankHits(
+    result.ids[0] ?? [],
+    result.metadatas[0] ?? [],
+    result.distances[0] ?? [],
+    opts.k,
+    !opts.file,
+  );
 
   if (opts.json) {
     console.log(JSON.stringify({ query, results: top }, null, 2));
@@ -48,8 +55,27 @@ export async function search(cfg: Config, query: string, opts: SearchOptions): P
   return top;
 }
 
-/** Overlapping windows and the three per-clip vectors collapse to one row per clip. */
-function dedupe(ids: string[], metadatas: (Record<string, unknown> | null)[], distances: (number | null)[]): Hit[] {
+/**
+ * Collapse Chroma's raw vectors to one row per clip (best modality) and,
+ * for a global search (perFile), to one row per video: the best clip of
+ * each file, so the top k are k distinct videos. A `--file` drill-in
+ * (perFile false) keeps every clip of that video.
+ */
+export function rankHits(
+  ids: string[],
+  metadatas: (Record<string, unknown> | null)[],
+  distances: (number | null)[],
+  k: number,
+  perFile: boolean,
+): Hit[] {
+  const hits = bestPerClip(ids, metadatas, distances);
+  hits.sort((a, b) => b.score - a.score);
+  const ranked = perFile ? collapsePerFile(hits) : hits;
+  return ranked.slice(0, k);
+}
+
+/** The three per-clip vectors collapse to the best modality. */
+function bestPerClip(ids: string[], metadatas: (Record<string, unknown> | null)[], distances: (number | null)[]): Hit[] {
   const best = new Map<string, Hit>();
   ids.forEach((id, i) => {
     const meta = metadatas[i];
@@ -68,6 +94,18 @@ function dedupe(ids: string[], metadatas: (Record<string, unknown> | null)[], di
     if (!prior || hit.score > prior.score) best.set(key, hit);
   });
   return [...best.values()];
+}
+
+/** Keep only the highest-scoring clip of each file; hits arrive score-sorted. */
+function collapsePerFile(hits: Hit[]): Hit[] {
+  const seen = new Set<string>();
+  const out: Hit[] = [];
+  for (const hit of hits) {
+    if (seen.has(hit.file)) continue;
+    seen.add(hit.file);
+    out.push(hit);
+  }
+  return out;
 }
 
 function buildWhere(opts: SearchOptions): Where | undefined {
