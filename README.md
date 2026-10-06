@@ -31,6 +31,18 @@ Three vectors per clip is deliberate: for sound-event queries ("ear blowing soun
 the audio-only vector is not diluted by ~85 % video tokens, while `combined` still
 carries the joint context.
 
+### Parallel embedding
+
+llama-server can serve several clips at once (`-np`/`parallel`). Ingest reads
+`/v1/models` before it starts and auto-detects the slot count of the configured
+model: `total_slots` on the entry (single-model builds), otherwise the `--parallel`
+value in `status.args`, otherwise the `parallel = N` line in `status.preset`
+(multi-model preset builds). It then keeps exactly that many clips in flight from a
+single queue over the whole corpus - windows of later files start while earlier
+files are still embedding, so the slots stay saturated and files with fewer windows
+than slots never leave capacity idle. Endpoints without slot reporting default to 1
+(sequential).
+
 ## Workflow - commands in order
 
 ```bash
@@ -40,52 +52,37 @@ cp .env.example .env
 # 1. vector database
 docker compose up -d
 
-# 2. embedding server (you start it; this app never does)
-llama-server -m C:\Users\maxkr\LLMs\embeddinggemma-2\embeddinggemma-2-BF16.gguf \
-  --mmproj C:\Users\maxkr\LLMs\embeddinggemma-2\mmproj-BF16.gguf \
-  --embedding --host 127.0.0.1 --port 8080 -ub 2048 \
-  --media-path C:\Dev\video-analysis-embeddings\.cache\media --no-webui
-
-# 3. optional but useful: pings Chroma and the embedding endpoint
+# 2. check: Chroma up, embedder preset present on the provider, slot count
 bun run doctor
 
-# 4. embed the corpus - re-runnable, only changed files are re-embedded
+# 3. embed the corpus - re-runnable, only changed files are re-embedded
 bun run db:ingest -- ./videos
 
-# 5. query as often as you like, no re-embedding needed
+# 4. query as often as you like, no re-embedding needed
 bun run start -- --search "Ear blowing sounds"
 bun run start -- --search "Ear blowing sounds" --modality audio --k 10
 bun run start -- --search "dog barking" --file 0042.mp4 --json
 
-# 6. reset: drops the collection, the manifest and the media cache
+# 5. reset: drops the collection, the manifest and the media cache
 bun run db:clear
 ```
 
-Steps 1 and 2 must be up before 4. Step 4 must have run before 5: an empty
-collection makes 5 print a hint instead of results. Quote the folder if its name
-contains glob characters, e.g. `bun run db:ingest -- "./a_lot_of_[0001-9999]"`.
+The embedding server is this machine's llama.cpp provider
+(`http://127.0.0.1:8080/v1`) - a multi-model build serving presets from
+`C:\Users\maxkr\llama-cpp.ini`. It must be up with the `embeddinggemma-2` preset
+loaded before ingest (start command in Setup); `doctor` fails loudly if the
+preset is missing and warns if it is listed but not loaded.
+
 `db:clear` also removes the manifest, so the next `db:ingest` re-embeds everything;
-to force a re-embed without dropping search history use `bun run db:ingest -- <folder> --fresh`.
-
-The endpoint defaults to `http://127.0.0.1:8080/v1` (`EMBED_BASE_URL`). Port 8080 is
-also where this machine's own llama.cpp provider listens, so if your server never
-managed to bind it, `doctor` will still answer - with a text-only chat model. That
-case is flagged explicitly:
-
-```
-embeddings  ok (qwen3.8-flash-next-iq3_s, inputs: text)
-            WARNING: text-only endpoint - image and audio clips will be rejected.
-            If that is not your embedding server, another service owns this port.
-```
-
-Move llama-server and `EMBED_BASE_URL` together (e.g. to 8081) if they collide.
+to force a re-embed without dropping search history use
+`bun run db:ingest -- <folder> --fresh`.
 
 ## Requirements
 
 - Bun 1.4+, ffmpeg/ffprobe on `PATH` (window + frame extraction)
 - Docker (Chroma)
-- A running **OpenAI-compatible embeddings server** with a multimodal
-  EmbeddingGemma 2 model. This app is only a client - it never starts a server.
+- A running **OpenAI-compatible embeddings server** with the multimodal
+  EmbeddingGemma 2 model (`--embedding` mode, `--mmproj` projector)
 
 ## Setup
 
@@ -94,27 +91,48 @@ cp .env.example .env
 docker compose up -d          # Chroma on http://127.0.0.1:8806
 ```
 
-Step 2 of the workflow is the llama-server invocation this project expects:
-llama.cpp >= b11456 (which added the `gemma-embedding2` arch), `--embedding` for
-embedding mode, `--mmproj` for the vision + audio projector, and `--media-path`
-pointing at `MEDIA_DIR` (default `.cache/media`) - see Media transport. `-ub 2048`
-avoids the server capping the vision token budget:
+The embedding server is started from the ini, from the folder containing it:
 
-```
-W srv load_model: cap image_max_tokens (original=1120) to 256 (n_ubatch = 512)
-W srv load_model: increase n_ubatch (-ub) to increase vision token budget
+```powershell
+llama-server --models-preset .\llama-cpp.ini
 ```
 
-The same settings live as preset `[embeddinggemma-2]` in `C:\Users\maxkr\llama-cpp.ini`
-(read via `--models-preset`): `model`, `mmproj`, `embedding = true`,
-`ubatch-size = 2048`, `no-webui` and the `media-path` above. Model files are in
-`C:\Users\maxkr\LLMs\embeddinggemma-2\` - `embeddinggemma-2-BF16.gguf` plus
-`mmproj-BF16.gguf` from `unsloth/embeddinggemma-2-GGUF`.
+The relevant preset, `[embeddinggemma-2]` in `C:\Users\maxkr\llama-cpp.ini`:
+
+```ini
+[embeddinggemma-2]
+model = C:\Users\maxkr\LLMs\embeddinggemma-2\embeddinggemma-2-BF16.gguf
+mmproj = C:\Users\maxkr\LLMs\embeddinggemma-2\mmproj-BF16.gguf
+embedding = true
+ubatch-size = 8192
+batch-size = 8192
+no-webui = true
+media-path = C:\Dev\video-analysis-embeddings\.cache\media
+image-max-tokens = 140
+parallel = 8
+```
+
+- `media-path` must point at `MEDIA_DIR` (default `.cache/media`) - that is how
+  `MEDIA_TRANSPORT=file` resolves `file://` URLs (see Media transport).
+- `parallel = 8` is what ingest picks up as the concurrency (see Parallel
+  embedding). Change it in the preset, restart the provider, done.
+- `image-max-tokens = 140` fixes the per-frame token cost the budget table below
+  assumes.
+
+Model files are in `C:\Users\maxkr\LLMs\embeddinggemma-2\` -
+`embeddinggemma-2-BF16.gguf` plus `mmproj-BF16.gguf` from
+`unsloth/embeddinggemma-2-GGUF`.
 
 Check both ends before ingesting:
 
 ```bash
 bun run doctor     # prints resolved config, then pings Chroma and the endpoint
+```
+
+A healthy readout:
+
+```
+embeddings  ok (embeddinggemma-2, inputs: text+image+audio, 8 parallel slots)
 ```
 
 ## Commands
@@ -128,30 +146,32 @@ bun run doctor     # prints resolved config, then pings Chroma and the endpoint
 
 Ingest is incremental: a file is re-embedded only when its size or mtime changed
 (`.cache/manifest.json`), and vectors are written with `upsert`, so re-running is
-safe. `.mp4 .m4v .mov .mkv .webm .avi` are picked up, recursively, in natural
-(numeric) order. Videos without an audio track get the `video` vector only.
+safe. A file's manifest entry is only saved after its vectors have been flushed to
+Chroma, so an interrupted run never loses already-embedded files silently.
+`.mp4 .m4v .mov .mkv .webm .avi` are picked up, recursively, in natural (numeric)
+order. Videos without an audio track get the `video` vector only.
 
 ## Window size and the token budget
 
-EmbeddingGemma 2 shares one 8192-token context across text, image and audio.
-At 1 fps a frame costs ~140 tokens and audio ~25 tokens/s:
+Each clip must fit into the **per-slot** context of the embedding model. At
+1 fps a frame costs ~140 tokens (the preset's `image-max-tokens`) and audio
+~25 tokens/s:
 
 |Clip|Video tokens|Audio tokens|Total|
 |---|---|---|---|
 |30 s|4200|750|**4950**|
 |45 s|6300|1125|7425|
-|60 s|8400|1500|9900 (over budget)|
+|60 s|8400|1500|9900|
 
-`CLIP_SECONDS=30` is therefore the default. A short tail window is merged into the
-previous one instead of being emitted as a runt, so a window can stretch to just
-under 40 s (<= ~6600 tokens) - still inside the budget. If the server rejects a
-clip, ingest names it:
+`CLIP_SECONDS=30` is the default. A short tail window is merged into the previous
+one instead of being emitted as a runt, so a window can stretch to just under
+40 s (~6600 tokens). If the server rejects a clip, ingest names it:
 
 ```
 error: 0042.mp4 00:25-00:55: ... context size ...
 ```
 
-then lower `CLIP_SECONDS` or raise `-c`.
+then lower `CLIP_SECONDS` or give the preset a larger `ctx-size`.
 
 ## Media transport
 
@@ -160,8 +180,8 @@ e.g. `file://c8cb671a5f90/c0002/f0017.jpg`. That keeps request bodies tiny and
 matches llama-server's `handle_media()`, which resolves such URLs against
 `--media-path` (subdirectories allowed, `..` rejected).
 
-`MEDIA_TRANSPORT=base64` inlines `data:image/jpeg;base64,...` instead. On llama.cpp
-build 11456 both base64 forms failed against this model:
+`MEDIA_TRANSPORT=base64` inlines `data:image/jpeg;base64,...` instead. On the
+llama.cpp builds tested both base64 forms failed against this model:
 
 - data URI -> `400 {"message":"Invalid uri-encoded base64 value"}`
 - raw base64 -> `500 Failed to load image or audio file`, with
@@ -171,24 +191,30 @@ Use `file` unless you have a reason not to.
 
 ## Config
 
-Everything is in `.env.example`. Notables: `EMBED_BASE_URL`, `EMBED_MODEL`,
-`EMBED_DIMS` (768; ingest fails loudly on a mismatch), `QUERY_PREFIX`
-(`task: search result | query: ` - required by EmbeddingGemma 2 for queries, media
-gets no prefix), `CHROMA_URL` (`:8806`, next free port in the `:88XX` scheme),
-`CLIP_SECONDS`, `OVERLAP_SECONDS`, `VIDEO_FPS`, `AUDIO_RATE`.
+Everything is in `.env.example`. Notables: `EMBED_BASE_URL`, `EMBED_MODEL`
+(must match the preset `id`/alias on the provider), `EMBED_DIMS` (768; ingest fails
+loudly on a mismatch), `QUERY_PREFIX` (`task: search result | query: ` - required by
+EmbeddingGemma 2 for queries, media gets no prefix), `CHROMA_URL` (`:8806`, next
+free port in the `:88XX` scheme), `CLIP_SECONDS`, `OVERLAP_SECONDS`, `VIDEO_FPS`,
+`AUDIO_RATE`. There is deliberately no concurrency setting: the slot count comes
+from the endpoint itself.
 
 ## Status of verification
 
-Verified end to end against a deterministic OpenAI-compatible test double: ffmpeg
-windowing, frame/audio extraction, three vectors per clip, silent-video handling,
-Chroma writes, incremental re-ingest, `--file`/`--modality` filters, dedupe,
-timestamp output, `db:clear`, both media transports.
+Verified end to end:
 
-**Not yet verified: embedding quality.** That needs your own `llama-server` (this
-machine was not free to run it). The multimodal payload shape, the 768-d
-L2-normalized output and the `input_modalities: [text, image, audio, video]`
-report were confirmed against a live llama-server build 11456 before it was shut
-down; the semantic ranking itself has not been measured.
+- against a deterministic OpenAI-compatible test double: ffmpeg windowing,
+  frame/audio extraction, three vectors per clip, silent-video handling, Chroma
+  writes, incremental re-ingest, `--file`/`--modality` filters, dedupe, timestamp
+  output, `db:clear`, both media transports, and the slot-saturated pool (mock
+  reports 4 slots -> 4 clips in flight, never more, across file boundaries);
+- against the live multi-model provider at `:8080`: the `/v1/models` shape,
+  auto-detected `parallel = 8` for the `embeddinggemma-2` preset, and the
+  loaded/unloaded state in `doctor`.
+
+**Not yet verified: embedding quality.** The multimodal payload shape, the 768-d
+L2-normalized output and the `input_modalities` report were confirmed against live
+llama-server builds; the semantic ranking itself has not been measured.
 
 ## Layout
 
@@ -197,9 +223,9 @@ src/cli.ts       arg parsing + dispatch (ingest | search | clear | doctor)
 src/config.ts    .env -> Config
 src/ffmpeg.ts    ffprobe probing, frame/WAV extraction
 src/windows.ts   window planning, mm:ss formatting
-src/embedder.ts  OpenAI SDK client, multimodal /v1/embeddings payload
+src/embedder.ts  OpenAI SDK client, multimodal /v1/embeddings payload, slot detection
 src/chroma.ts    collection bootstrap (cosine, no server-side embedding fn)
-src/ingest.ts    per-file pipeline, batching, manifest
+src/ingest.ts    per-corpus pipeline: plan, slot-saturated pool, batching, manifest
 src/search.ts    query, dedupe, output
 src/clear.ts     collection + manifest + media cache removal
 ```
