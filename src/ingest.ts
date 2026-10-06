@@ -6,7 +6,7 @@ import { ensureDirs, type Config } from "./config.ts";
 import { Embedder, MODALITIES, type Modality } from "./embedder.ts";
 import { extractClip, hasAudioStream, probeDuration, removeClip } from "./ffmpeg.ts";
 import { hash12, loadManifest, saveManifest } from "./manifest.ts";
-import { fmtRange, planWindows } from "./windows.ts";
+import { fmtRange, planWindows, type Window } from "./windows.ts";
 
 const VIDEO_EXT = [".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi"];
 
@@ -21,6 +21,20 @@ interface PendingRecord {
   metadata: Record<string, string | number>;
 }
 
+interface FileJob {
+  abs: string;
+  rel: string;
+  fileId: string;
+  size: number;
+  mtimeMs: number;
+  duration: number;
+  windows: Window[];
+  want: Modality[];
+  withAudio: boolean;
+  /** windows of this file not yet finished; the file completes at 0 */
+  left: number;
+}
+
 export async function ingest(cfg: Config, root: string, opts: IngestOptions): Promise<void> {
   await ensureDirs(cfg);
   const videos = findVideos(root);
@@ -31,12 +45,14 @@ export async function ingest(cfg: Config, root: string, opts: IngestOptions): Pr
 
   const collection = await openCollection(cfg);
   const embedder = new Embedder(cfg);
+  const model = await embedder.probeModel();
   const manifest = await loadManifest(cfg.manifestPath);
   const pending: PendingRecord[] = [];
-  let filesEmbedded = 0;
-  let filesSkipped = 0;
-  let recordsWritten = 0;
 
+  // Plan every file that needs embedding up front so the pool below can keep
+  // the endpoint's slots busy across file boundaries.
+  const jobs: FileJob[] = [];
+  let filesSkipped = 0;
   for (const abs of videos) {
     const rel = relative(root, abs).replace(/\\/g, "/");
     const stat = statSync(abs);
@@ -45,96 +61,116 @@ export async function ingest(cfg: Config, root: string, opts: IngestOptions): Pr
       filesSkipped++;
       continue;
     }
-
-    const fileId = prior?.fileId ?? hash12(rel);
-    console.log(`${rel}  (${(stat.size / 1e6).toFixed(1)} MB)`);
-    const { clips, records } = await ingestFile(cfg, embedder, collection, abs, rel, fileId, pending, opts);
-    await flush(collection, pending);
-
-    manifest[rel] = {
-      fileId,
+    const duration = await probeDuration(abs);
+    const windows = planWindows(duration, cfg.clipSeconds, cfg.overlapSeconds);
+    if (windows.length === 0) {
+      console.log(`${rel}: ffprobe reports no duration, skipping`);
+      filesSkipped++;
+      continue;
+    }
+    const withAudio = await hasAudioStream(abs);
+    jobs.push({
+      abs,
+      rel,
+      fileId: prior?.fileId ?? hash12(rel),
       size: stat.size,
       mtimeMs: stat.mtimeMs,
-      clips,
-      embeddedAt: new Date().toISOString(),
-    };
-    await saveManifest(cfg.manifestPath, manifest);
-
-    filesEmbedded++;
-    recordsWritten += records;
-    console.log(`  ${clips} clips -> ${records} vectors (collection now ${await collection.count()})`);
+      duration,
+      windows,
+      want: withAudio ? [...MODALITIES] : ["video"],
+      withAudio,
+      left: windows.length,
+    });
+    console.log(`${rel}  (${(stat.size / 1e6).toFixed(1)} MB)`);
   }
+
+  if (jobs.length === 0) {
+    console.log(`\ndone: 0 file(s) embedded, ${filesSkipped} unchanged, 0 vectors upserted`);
+    return;
+  }
+  const totalWindows = jobs.reduce((n, j) => n + j.windows.length, 0);
+  console.log(
+    `embedding endpoint: ${model.id}${model.loaded ? "" : " (NOT LOADED)"}, ${model.slots} parallel slot${model.slots === 1 ? "" : "s"} - ${jobs.length} file(s), ${totalWindows} window(s)`,
+  );
+
+  let filesEmbedded = 0;
+  let recordsWritten = 0;
+  const work: { job: FileJob; index: number }[] = [];
+  for (const job of jobs) for (let index = 0; index < job.windows.length; index++) work.push({ job, index });
+
+  // One global queue over all windows, at most `slots` in flight: the endpoint
+  // can only embed that many clips at once, so going wider just queues work
+  // inside the server, and a single queue keeps the slots fed as files finish.
+  await runPool(work, model.slots, async ({ job, index }) => {
+    const window = job.windows[index]!;
+    const media = await extractClip(cfg, job.abs, window, `${job.fileId}/c${String(index).padStart(4, "0")}`, job.withAudio);
+    let vectors: Record<Modality, number[]>;
+    try {
+      vectors = await embedder.embedClip(media, job.want);
+    } catch (err) {
+      // a context-overflow error is only actionable if the clip is named
+      throw new Error(`${job.rel} ${fmtRange(window)}: ${err instanceof Error ? err.message : err}`);
+    }
+
+    for (const modality of job.want) {
+      pending.push({
+        id: `${job.fileId}:${index}:${modality}`,
+        embedding: vectors[modality],
+        metadata: {
+          file: job.rel,
+          name: job.rel.slice(job.rel.lastIndexOf("/") + 1),
+          file_id: job.fileId,
+          clip_index: index,
+          t_start: round2(window.start),
+          t_end: round2(window.end),
+          modality,
+          fps: cfg.videoFps,
+          duration: round2(job.duration),
+        },
+      });
+    }
+    if (!opts.keepMedia) await removeClip(media.dir);
+    console.log(`  ${job.rel}  ${fmtRange(window)}  ${job.want.join("+")}  ${media.frames.length} frames`);
+
+    if (--job.left === 0) {
+      // flush before marking the file done, so the manifest never claims
+      // vectors that are still only in `pending`
+      await flush(collection, pending);
+      if (!opts.keepMedia) await removeClip(join(cfg.mediaDir, job.fileId));
+      manifest[job.rel] = {
+        fileId: job.fileId,
+        size: job.size,
+        mtimeMs: job.mtimeMs,
+        clips: job.windows.length,
+        embeddedAt: new Date().toISOString(),
+      };
+      await saveManifest(cfg.manifestPath, manifest);
+      const records = job.windows.length * job.want.length;
+      filesEmbedded++;
+      recordsWritten += records;
+      console.log(`  ${job.rel}: ${job.windows.length} clips -> ${records} vectors (collection now ${await collection.count()})`);
+    }
+    if (pending.length >= cfg.batchRecords) await flush(collection, pending);
+  });
+
+  await flush(collection, pending);
 
   console.log(
     `\ndone: ${filesEmbedded} file(s) embedded, ${filesSkipped} unchanged, ${recordsWritten} vectors upserted`,
   );
 }
 
-async function ingestFile(
-  cfg: Config,
-  embedder: Embedder,
-  collection: Collection,
-  abs: string,
-  rel: string,
-  fileId: string,
-  pending: PendingRecord[],
-  opts: IngestOptions,
-): Promise<{ clips: number; records: number }> {
-  const duration = await probeDuration(abs);
-  const withAudio = await hasAudioStream(abs);
-  const windows = planWindows(duration, cfg.clipSeconds, cfg.overlapSeconds);
-  const want: Modality[] = withAudio ? [...MODALITIES] : ["video"];
-  let records = 0;
-
-  for (let index = 0; index < windows.length; index++) {
-    const window = windows[index]!;
-    const media = await extractClip(cfg, abs, window, `${fileId}/c${String(index).padStart(4, "0")}`, withAudio);
-    let vectors: Record<Modality, number[]>;
-    try {
-      vectors = await embedder.embedClip(media, want);
-    } catch (err) {
-      // a context-overflow error is only actionable if the clip is named
-      throw new Error(`${rel} ${fmtRange(window)}: ${err instanceof Error ? err.message : err}`);
-    }
-
-    for (const modality of want) {
-      pending.push({
-        id: `${fileId}:${index}:${modality}`,
-        embedding: vectors[modality],
-        metadata: {
-          file: rel,
-          name: rel.slice(rel.lastIndexOf("/") + 1),
-          file_id: fileId,
-          clip_index: index,
-          t_start: round2(window.start),
-          t_end: round2(window.end),
-          modality,
-          fps: cfg.videoFps,
-          duration: round2(duration),
-        },
-      });
-      records++;
-    }
-
-    if (!opts.keepMedia) await removeClip(media.dir);
-    console.log(`  ${fmtRange(window)}  ${want.join("+")}  ${media.frames.length} frames`);
-    if (pending.length >= cfg.batchRecords) await flush(collection, pending);
-  }
-
-  if (!opts.keepMedia) await removeClip(join(cfg.mediaDir, fileId));
-
-  return { clips: windows.length, records };
-}
-
 async function flush(collection: Collection, pending: PendingRecord[]): Promise<void> {
-  if (pending.length === 0) return;
+  // splice (not `pending.length = 0` after the await): other windows keep
+  // pushing records while an upsert is in flight
+  const batch = pending.splice(0, pending.length);
+  if (batch.length === 0) return;
   // upsert, not add: re-ingesting a changed file reuses the same ids
   await collection.upsert({
-    ids: pending.map((r) => r.id),
-    embeddings: pending.map((r) => r.embedding),
-    metadatas: pending.map((r) => r.metadata),
+    ids: batch.map((r) => r.id),
+    embeddings: batch.map((r) => r.embedding),
+    metadatas: batch.map((r) => r.metadata),
   });
-  pending.length = 0;
 }
 
 function findVideos(root: string): string[] {
@@ -161,6 +197,20 @@ function naturalCompare(a: string, b: string): number {
     return x < y ? -1 : 1;
   }
   return 0;
+}
+
+/** Runs `worker` over `items` with at most `limit` calls in flight. */
+async function runPool<T>(items: T[], limit: number, worker: (item: T, index: number) => Promise<void>): Promise<void> {
+  const lanes = Math.max(1, Math.min(limit, items.length));
+  let next = 0;
+  const lane = async (): Promise<void> => {
+    for (;;) {
+      const index = next++;
+      if (index >= items.length) return;
+      await worker(items[index]!, index);
+    }
+  };
+  await Promise.all(Array.from({ length: lanes }, () => lane()));
 }
 
 function round2(n: number): number {

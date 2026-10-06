@@ -92,9 +92,13 @@ async function doctor(cfg: Config): Promise<void> {
   try {
     const model = await new Embedder(cfg).probeModel();
     const inputs = model.modalities.length > 0 ? `, inputs: ${model.modalities.join("+")}` : "";
-    console.log(`embeddings  ok (${model.id}${inputs})`);
+    const slots = model.slots > 1 ? `, ${model.slots} parallel slots` : "";
+    console.log(`embeddings  ok (${model.id}${inputs}${slots})`);
     if (model.id !== cfg.embedModel) {
       console.log(`            note: endpoint serves "${model.id}", config asks for "${cfg.embedModel}"`);
+    }
+    if (!model.loaded) {
+      console.log(`            WARNING: model is listed but not loaded - embedding requests will fail until it is loaded.`);
     }
     if (model.modalities.length > 0 && model.modalities.every((m) => m === "text")) {
       console.log("            WARNING: text-only endpoint - image and audio clips will be rejected.");

@@ -9,6 +9,14 @@ type ImagePart = { type: "image_url"; image_url: { url: string } };
 type AudioPart = { type: "input_audio"; input_audio: { url?: string; data?: string } };
 type TextPart = { type: "text"; text: string };
 type ContentPart = ImagePart | AudioPart | TextPart;
+type ModelInfo = {
+  id?: string;
+  architecture?: { input_modalities?: string[] };
+  /** Single-model llama.cpp builds report the slot count on the entry itself. */
+  total_slots?: number;
+  /** Multi-model preset builds carry the spawn command line and the ini text. */
+  status?: { value?: string; args?: string[]; preset?: string };
+};
 
 /**
  * EmbeddingGemma 2 client over an OpenAI-compatible `/v1/embeddings` endpoint
@@ -27,18 +35,25 @@ export class Embedder {
     });
   }
 
-  /** llama-server reports the loaded model and the modalities it accepts. */
-  async probeModel(): Promise<{ id: string; modalities: string[] }> {
+  /**
+   * llama-server reports the model, the modalities it accepts, whether it is
+   * loaded (multi-model preset builds), and how many parallel slots serve it.
+   */
+  async probeModel(): Promise<{ id: string; modalities: string[]; loaded: boolean; slots: number }> {
     const base = this.cfg.embedBaseUrl.endsWith("/") ? this.cfg.embedBaseUrl : `${this.cfg.embedBaseUrl}/`;
     const url = new URL("models", base);
     const res = await fetch(url);
     if (!res.ok) throw new Error(`GET ${url} -> ${res.status}`);
-    const body = (await res.json()) as {
-      data?: { id?: string; architecture?: { input_modalities?: string[] } }[];
-    };
+    const body = (await res.json()) as { data?: ModelInfo[] };
     const chosen = (body.data ?? []).find((m) => m.id === this.cfg.embedModel) ?? body.data?.[0];
     if (!chosen?.id) throw new Error("endpoint reported no models");
-    return { id: chosen.id, modalities: chosen.architecture?.input_modalities ?? [] };
+    return {
+      id: chosen.id,
+      modalities: chosen.architecture?.input_modalities ?? [],
+      // classic single-model builds have no status field and always serve the loaded model
+      loaded: chosen.status ? chosen.status.value === "loaded" : true,
+      slots: slotsFor(chosen),
+    };
   }
 
   async embedText(text: string): Promise<number[]> {
@@ -81,6 +96,32 @@ function vectorAt(vectors: number[][], index: number): number[] {
   const vector = vectors[index];
   if (!vector) throw new Error(`embedding endpoint omitted vector ${index}`);
   return vector;
+}
+/**
+ * How many clips a llama-server can embed at once (its slots).
+ * Detection order: `total_slots` (single-model builds), the `--parallel`/`-np`
+ * value in `status.args` (the spawn command line), the `parallel = N` line in
+ * `status.preset` (the ini text). Non-llama endpoints report nothing -> 1,
+ * which keeps embedding sequential.
+ */
+function slotsFor(model: ModelInfo): number {
+  if (Number.isInteger(model.total_slots) && (model.total_slots ?? 0) >= 1) return model.total_slots as number;
+  const args = model.status?.args;
+  if (args) {
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i]!;
+      if (a === "--parallel" || a === "-np") {
+        const n = Number(args[i + 1]);
+        if (Number.isInteger(n) && n >= 1) return n;
+      } else if (a.startsWith("--parallel=")) {
+        const n = Number(a.slice("--parallel=".length));
+        if (Number.isInteger(n) && n >= 1) return n;
+      }
+    }
+  }
+  const line = model.status?.preset?.match(/^parallel\s*=\s*(\d+)\s*$/m);
+  if (line?.[1]) return Number(line[1]);
+  return 1;
 }
 
 async function partsFor(cfg: Config, media: ClipMedia, modality: Modality): Promise<ContentPart[]> {
