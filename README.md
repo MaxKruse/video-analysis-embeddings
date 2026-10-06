@@ -41,7 +41,7 @@ docker compose up -d
 
 # 2. embedding server (you start it; this app never does)
 llama-server -m models/embeddinggemma-2-Q8_0.gguf --mmproj models/mmproj-Q8_0.gguf \
-  --embedding --host 127.0.0.1 --port 8081 -c 16384 -ub 2048 -ngl 99 \
+  --embedding --host 127.0.0.1 --port 8080 -c 16384 -ub 2048 -ngl 99 \
   --media-path .cache/media --no-webui
 
 # 3. optional but useful: pings Chroma and the embedding endpoint
@@ -64,6 +64,19 @@ collection makes 5 print a hint instead of results. Quote the folder if its name
 contains glob characters, e.g. `bun run db:ingest -- "./a_lot_of_[0001-9999]"`.
 `db:clear` also removes the manifest, so the next `db:ingest` re-embeds everything;
 to force a re-embed without dropping search history use `bun run db:ingest -- <folder> --fresh`.
+
+The endpoint defaults to `http://127.0.0.1:8080/v1` (`EMBED_BASE_URL`). Port 8080 is
+also where this machine's own llama.cpp provider listens, so if your server never
+managed to bind it, `doctor` will still answer - with a text-only chat model. That
+case is flagged explicitly:
+
+```
+embeddings  ok (qwen3.8-flash-next-iq3_s, inputs: text)
+            WARNING: text-only endpoint - image and audio clips will be rejected.
+            If that is not your embedding server, another service owns this port.
+```
+
+Move llama-server and `EMBED_BASE_URL` together (e.g. to 8081) if they collide.
 
 ## Requirements
 
