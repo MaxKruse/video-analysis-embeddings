@@ -3,9 +3,9 @@
 Semantic search over a folder of MP4s: ask in plain text, get **file + timestamp range**.
 
 ```
-bun run db:clear
-bun run db:ingest -- ./folder/with/a_lot_of_[0001-9999].mp4
+bun run db:ingest -- ./videos
 bun run start -- --search "Ear blowing sounds"
+bun run db:clear
 ```
 
 ```
@@ -30,6 +30,41 @@ Three vectors per clip is deliberate: for sound-event queries ("ear blowing soun
 the audio-only vector is not diluted by ~85 % video tokens, while `combined` still
 carries the joint context.
 
+## Workflow - commands in order
+
+```bash
+# 0. once: config
+cp .env.example .env
+
+# 1. vector database
+docker compose up -d
+
+# 2. embedding server (you start it; this app never does)
+llama-server -m models/embeddinggemma-2-Q8_0.gguf --mmproj models/mmproj-Q8_0.gguf \
+  --embedding --host 127.0.0.1 --port 8081 -c 16384 -ub 2048 -ngl 99 \
+  --media-path .cache/media --no-webui
+
+# 3. optional but useful: pings Chroma and the embedding endpoint
+bun run doctor
+
+# 4. embed the corpus - re-runnable, only changed files are re-embedded
+bun run db:ingest -- ./videos
+
+# 5. query as often as you like, no re-embedding needed
+bun run start -- --search "Ear blowing sounds"
+bun run start -- --search "Ear blowing sounds" --modality audio --k 10
+bun run start -- --search "dog barking" --file 0042.mp4 --json
+
+# 6. reset: drops the collection, the manifest and the media cache
+bun run db:clear
+```
+
+Steps 1 and 2 must be up before 4. Step 4 must have run before 5: an empty
+collection makes 5 print a hint instead of results. Quote the folder if its name
+contains glob characters, e.g. `bun run db:ingest -- "./a_lot_of_[0001-9999]"`.
+`db:clear` also removes the manifest, so the next `db:ingest` re-embeds everything;
+to force a re-embed without dropping search history use `bun run db:ingest -- <folder> --fresh`.
+
 ## Requirements
 
 - Bun 1.4+, ffmpeg/ffprobe on `PATH` (window + frame extraction)
@@ -44,20 +79,11 @@ cp .env.example .env
 docker compose up -d          # Chroma on http://127.0.0.1:8806
 ```
 
-Start the embedding server yourself (llama.cpp >= b11456, which added the
-`gemma-embedding2` arch):
-
-```bash
-llama-server \
-  -m models/embeddinggemma-2-Q8_0.gguf \
-  --mmproj models/mmproj-Q8_0.gguf \
-  --embedding --host 127.0.0.1 --port 8081 \
-  -c 16384 -ub 2048 -ngl 99 \
-  --media-path .cache/media --no-webui
-```
-
-`--media-path` must point at `MEDIA_DIR` (default `.cache/media`) - see Media
-transport. `-ub 2048` avoids the server capping the vision token budget:
+Step 2 of the workflow is the llama-server invocation this project expects:
+llama.cpp >= b11456 (which added the `gemma-embedding2` arch), `--embedding` for
+embedding mode, `--mmproj` for the vision + audio projector, and `--media-path`
+pointing at `MEDIA_DIR` (default `.cache/media`) - see Media transport. `-ub 2048`
+avoids the server capping the vision token budget:
 
 ```
 W srv load_model: cap image_max_tokens (original=1120) to 256 (n_ubatch = 512)
