@@ -40,9 +40,10 @@ cp .env.example .env
 docker compose up -d
 
 # 2. embedding server (you start it; this app never does)
-llama-server -m models/embeddinggemma-2-Q8_0.gguf --mmproj models/mmproj-Q8_0.gguf \
-  --embedding --host 127.0.0.1 --port 8080 -c 16384 -ub 2048 -ngl 99 \
-  --media-path .cache/media --no-webui
+llama-server -m C:\Users\maxkr\LLMs\embeddinggemma-2\embeddinggemma-2-BF16.gguf \
+  --mmproj C:\Users\maxkr\LLMs\embeddinggemma-2\mmproj-BF16.gguf \
+  --embedding --host 127.0.0.1 --port 8080 -ub 2048 \
+  --media-path C:\Dev\video-analysis-embeddings\.cache\media --no-webui
 
 # 3. optional but useful: pings Chroma and the embedding endpoint
 bun run doctor
@@ -102,6 +103,12 @@ avoids the server capping the vision token budget:
 W srv load_model: cap image_max_tokens (original=1120) to 256 (n_ubatch = 512)
 W srv load_model: increase n_ubatch (-ub) to increase vision token budget
 ```
+
+The same settings live as preset `[embeddinggemma-2]` in `C:\Users\maxkr\llama-cpp.ini`
+(read via `--models-preset`): `model`, `mmproj`, `embedding = true`,
+`ubatch-size = 2048`, `no-webui` and the `media-path` above. Model files are in
+`C:\Users\maxkr\LLMs\embeddinggemma-2\` - `embeddinggemma-2-BF16.gguf` plus
+`mmproj-BF16.gguf` from `unsloth/embeddinggemma-2-GGUF`.
 
 Check both ends before ingesting:
 
