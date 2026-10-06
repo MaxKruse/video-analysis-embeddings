@@ -57,7 +57,7 @@ export function loadConfig(): Config {
     collection: Bun.env.COLLECTION || "video_clips",
     dims: num("EMBED_DIMS", 768),
 
-    embedBaseUrl: Bun.env.EMBED_BASE_URL || "http://127.0.0.1:8081/v1",
+    embedBaseUrl: Bun.env.EMBED_BASE_URL || "http://127.0.0.1:8080/v1",
     embedApiKey: Bun.env.EMBED_API_KEY || "none",
     embedModel: Bun.env.EMBED_MODEL || "embeddinggemma-2",
     queryPrefix: Bun.env.QUERY_PREFIX ?? "task: search result | query: ",

@@ -27,9 +27,18 @@ export class Embedder {
     });
   }
 
-  async listModels(): Promise<string[]> {
-    const res = await this.openai.models.list();
-    return res.data.map((m) => m.id);
+  /** llama-server reports the loaded model and the modalities it accepts. */
+  async probeModel(): Promise<{ id: string; modalities: string[] }> {
+    const base = this.cfg.embedBaseUrl.endsWith("/") ? this.cfg.embedBaseUrl : `${this.cfg.embedBaseUrl}/`;
+    const url = new URL("models", base);
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`GET ${url} -> ${res.status}`);
+    const body = (await res.json()) as {
+      data?: { id?: string; architecture?: { input_modalities?: string[] } }[];
+    };
+    const chosen = (body.data ?? []).find((m) => m.id === this.cfg.embedModel) ?? body.data?.[0];
+    if (!chosen?.id) throw new Error("endpoint reported no models");
+    return { id: chosen.id, modalities: chosen.architecture?.input_modalities ?? [] };
   }
 
   async embedText(text: string): Promise<number[]> {

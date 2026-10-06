@@ -90,8 +90,16 @@ async function doctor(cfg: Config): Promise<void> {
   }
 
   try {
-    const models = await new Embedder(cfg).listModels();
-    console.log(`embeddings  ok (models: ${models.join(", ")})`);
+    const model = await new Embedder(cfg).probeModel();
+    const inputs = model.modalities.length > 0 ? `, inputs: ${model.modalities.join("+")}` : "";
+    console.log(`embeddings  ok (${model.id}${inputs})`);
+    if (model.id !== cfg.embedModel) {
+      console.log(`            note: endpoint serves "${model.id}", config asks for "${cfg.embedModel}"`);
+    }
+    if (model.modalities.length > 0 && model.modalities.every((m) => m === "text")) {
+      console.log("            WARNING: text-only endpoint - image and audio clips will be rejected.");
+      console.log("            If that is not your embedding server, another service owns this port.");
+    }
   } catch (err) {
     console.log(`embeddings  UNREACHABLE at ${cfg.embedBaseUrl} (${message(err)})`);
   }
