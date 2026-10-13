@@ -4,12 +4,12 @@ Semantic search over a folder of MP4s: ask in plain text, get **file + timestamp
 
 ```
 bun run db:ingest -- ./videos
-bun run start -- --search "Ear blowing sounds"
+bun run start -- --search "dog barking"
 bun run db:clear
 ```
 
 ```
-query: "Ear blowing sounds"   collection video_clips (184 vectors)
+query: "dog barking"   collection video_clips (184 vectors)
 
  1. 0042.mp4  02:15-02:45  combined  0.631
  2. 0017.mp4  00:50-01:10  audio     0.588
@@ -27,7 +27,7 @@ query: "Ear blowing sounds"   collection video_clips (184 vectors)
    clip to one row, and keeps only the best clip of each video - so the top k are k
    distinct videos. `--file` drills into one video and returns its matching clips.
 
-Three vectors per clip is deliberate: for sound-event queries ("ear blowing sounds")
+Three vectors per clip is deliberate: for sound-event queries ("dog barking")
 the audio-only vector is not diluted by ~85 % video tokens, while `combined` still
 carries the joint context.
 
@@ -59,8 +59,8 @@ bun run doctor
 bun run db:ingest -- ./videos
 
 # 4. query as often as you like, no re-embedding needed
-bun run start -- --search "Ear blowing sounds"
-bun run start -- --search "Ear blowing sounds" --modality audio --k 10
+bun run start -- --search "dog barking"
+bun run start -- --search "dog barking" --modality audio --k 10
 bun run start -- --search "dog barking" --file 0042.mp4 --json
 
 # 5. reset: drops the collection, the manifest and the media cache
@@ -69,7 +69,7 @@ bun run db:clear
 
 The embedding server is this machine's llama.cpp provider
 (`http://127.0.0.1:8080/v1`) - a multi-model build serving presets from
-`C:\Users\maxkr\llama-cpp.ini`. It must be up with the `embeddinggemma-2` preset
+`C:\Users\<you>\llama-cpp.ini`. It must be up with the `embeddinggemma-2` preset
 loaded before ingest (start command in Setup); `doctor` fails loudly if the
 preset is missing and warns if it is listed but not loaded.
 
@@ -97,12 +97,12 @@ The embedding server is started from the ini, from the folder containing it:
 llama-server --models-preset .\llama-cpp.ini
 ```
 
-The relevant preset, `[embeddinggemma-2]` in `C:\Users\maxkr\llama-cpp.ini`:
+The relevant preset, `[embeddinggemma-2]` in `C:\Users\<you>\llama-cpp.ini`:
 
 ```ini
 [embeddinggemma-2]
-model = C:\Users\maxkr\LLMs\embeddinggemma-2\embeddinggemma-2-BF16.gguf
-mmproj = C:\Users\maxkr\LLMs\embeddinggemma-2\mmproj-BF16.gguf
+model = C:\Users\<you>\LLMs\embeddinggemma-2\embeddinggemma-2-BF16.gguf
+mmproj = C:\Users\<you>\LLMs\embeddinggemma-2\mmproj-BF16.gguf
 embedding = true
 ubatch-size = 8192
 batch-size = 8192
@@ -119,7 +119,7 @@ parallel = 8
 - `image-max-tokens = 140` fixes the per-frame token cost the budget table below
   assumes.
 
-Model files are in `C:\Users\maxkr\LLMs\embeddinggemma-2\` -
+Model files are in `C:\Users\<you>\LLMs\embeddinggemma-2\` -
 `embeddinggemma-2-BF16.gguf` plus `mmproj-BF16.gguf` from
 `unsloth/embeddinggemma-2-GGUF`.
 
